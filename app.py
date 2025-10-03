@@ -1,239 +1,161 @@
-import os
+from flask import Flask, render_template, request, jsonify, redirect, url_for
 import requests
-from datetime import datetime
-from flask import Flask, request, jsonify, render_template, url_for, send_from_directory
-from flask_sqlalchemy import SQLAlchemy
+import sqlite3
+import stripe
+import os
 
-# ---------------- CONFIG ----------------
 app = Flask(__name__)
-BASE_DIR = os.path.abspath(os.path.dirname(__file__))
-DB_PATH = os.getenv("DATABASE_URL", "sqlite:///store.db")
-app.config["SQLALCHEMY_DATABASE_URI"] = DB_PATH
-app.config["SQLALCHEMY_TRACK_MODIFICATIONS"] = False
-db = SQLAlchemy(app)
 
-STRIPE_SECRET_KEY = os.getenv("STRIPE_SECRET_KEY", "")
-STRIPE_WEBHOOK_SECRET = os.getenv("STRIPE_WEBHOOK_SECRET", "")
-SMS_ACTIVATE_API_KEY = os.getenv("SMS_ACTIVATE_API_KEY", "")
-SMS_ACTIVATE_API_BASE = os.getenv("SMS_ACTIVATE_API_BASE", "https://api.sms-activate.ae/stubs/handler_api.php")
-PORT = int(os.getenv("PORT", 5000))
+# ----------------------------
+# ✅ STRIPE CONFIG
+# ----------------------------
+stripe.api_key = os.getenv("STRIPE_SECRET_KEY", "sk_test_123")  # Ganti bila live
+CURRENCY = "myr"
 
-# ---------------- MODELS ----------------
-class Product(db.Model):
-    id = db.Column(db.Integer, primary_key=True)
-    slug = db.Column(db.String(80), unique=True, nullable=False)
-    name = db.Column(db.String(200), nullable=False)
-    service_code = db.Column(db.String(50), nullable=True)
-    country = db.Column(db.String(10), nullable=True)
-    price = db.Column(db.Integer, nullable=False)          # sale price (sen MYR)
-    original_price = db.Column(db.Integer, nullable=True)  # original price (sen MYR)
-    description = db.Column(db.Text, nullable=True)
-    image_filename = db.Column(db.String(200), nullable=True)
+# ----------------------------
+# ✅ SMS ACTIVATE CONFIG
+# ----------------------------
+SMS_API_KEY = os.getenv("SMS_ACTIVATE_API_KEY", "your_api_key_here")
+SMS_COUNTRY = 7  # Malaysia
 
-class Order(db.Model):
-    id = db.Column(db.Integer, primary_key=True)
-    created_at = db.Column(db.DateTime, default=datetime.utcnow)
-    product_id = db.Column(db.Integer, db.ForeignKey('product.id'))
-    product = db.relationship('Product')
-    amount = db.Column(db.Integer, nullable=False)  # price at time (sen)
-    stripe_session_id = db.Column(db.String(300), nullable=True)
-    stripe_payment_intent = db.Column(db.String(300), nullable=True)
-    status = db.Column(db.String(50), default="pending")  # pending, paid, fulfilled, failed
-    sms_activate_order_id = db.Column(db.String(200), nullable=True)
-    number = db.Column(db.String(100), nullable=True)
-    raw_response = db.Column(db.Text, nullable=True)
-    otp_code = db.Column(db.String(50), nullable=True)  # store received OTP if any
+PRODUCT_MAPPING = {
+    "zus": "aik",
+    "kfc": "fz",
+    "chagee": "bwx",
+    "tealive": "avb"
+}
 
-# ---------------- INIT & SEED ----------------
-@app.before_first_request
+# ----------------------------
+# ✅ DATABASE SETUP
+# ----------------------------
 def init_db():
-    db.create_all()
-    if Product.query.count() == 0:
-        products = [
-            Product(slug="zus-coffee", name="Zus Coffee Voucher", service_code="aik", country="7", price=150, original_price=180, description="Nikmati diskaun eksklusif untuk minuman pilihan di ZUS Coffee. Sah di cawangan terlibat.", image_filename="zus.jpg"),
-            Product(slug="kfc-rm10", name="KFC Voucher — RM10 OFF", service_code="fz", country="7", price=150, original_price=180, description="Gunakan baucar ini untuk potongan RM10 bagi pembelian di KFC (dine-in/takeaway/delivery).", image_filename="kfc.jpg"),
-            Product(slug="chagee-b1f1", name="CHAGEE Voucher — Buy 1 Free 1", service_code="bwx", country="7", price=150, original_price=180, description="Beli satu minuman terpilih dan dapatkan satu lagi secara percuma di CHAGEE.", image_filename="chagee.jpg"),
-            Product(slug="tealive-voucher", name="Tealive Voucher", service_code="avb", country="7", price=150, original_price=180, description="Baucar istimewa untuk minuman Tealive kegemaran anda. Sah untuk tebus di kaunter.", image_filename="tealive.jpg"),
-        ]
-        for p in products:
-            db.session.add(p)
-        db.session.commit()
+    conn = sqlite3.connect("database.db")
+    c = conn.cursor()
+    c.execute("""
+        CREATE TABLE IF NOT EXISTS products (
+            id INTEGER PRIMARY KEY AUTOINCREMENT,
+            name TEXT,
+            code TEXT,
+            original_price INTEGER,
+            price INTEGER
+        )
+    """)
+    c.execute("""
+        CREATE TABLE IF NOT EXISTS orders (
+            id INTEGER PRIMARY KEY AUTOINCREMENT,
+            product_id INTEGER,
+            phone_number TEXT,
+            otp_code TEXT,
+            amount_paid INTEGER
+        )
+    """)
+    conn.commit()
+    conn.close()
 
-# ---------------- ROUTES ----------------
-@app.route("/")
-def index():
-    products = Product.query.all()
+def seed_products():
+    conn = sqlite3.connect("database.db")
+    c = conn.cursor()
+    products = [
+        ("Zus Coffee", "zus", 180, 150),
+        ("KFC RM10 OFF", "kfc", 180, 150),
+        ("CHAGEE Buy1Free1", "chagee", 180, 150),
+        ("Tealive Voucher", "tealive", 180, 150)
+    ]
+    for p in products:
+        c.execute("SELECT id FROM products WHERE code = ?", (p[1],))
+        if not c.fetchone():
+            c.execute("INSERT INTO products (name, code, original_price, price) VALUES (?, ?, ?, ?)", p)
+    conn.commit()
+    conn.close()
+
+# ----------------------------
+# ✅ ROUTES
+# ----------------------------
+@app.route('/')
+def home():
+    conn = sqlite3.connect("database.db")
+    c = conn.cursor()
+    c.execute("SELECT id, name, original_price, price, code FROM products")
+    products = c.fetchall()
+    conn.close()
     return render_template("index.html", products=products)
 
-@app.route("/product/<slug>")
-def product_detail(slug):
-    p = Product.query.filter_by(slug=slug).first_or_404()
-    return render_template("product.html", product=p)
+@app.route('/checkout/<product_code>', methods=['POST'])
+def create_checkout_session(product_code):
+    conn = sqlite3.connect("database.db")
+    c = conn.cursor()
+    c.execute("SELECT id, name, price FROM products WHERE code = ?", (product_code,))
+    product = c.fetchone()
+    conn.close()
 
-@app.route("/create-checkout-session", methods=["POST"])
-def create_checkout_session():
-    data = request.get_json() or {}
-    product_id = data.get("product_id")
-    if not product_id:
-        return jsonify({"error": "missing product_id"}), 400
-    product = Product.query.get(product_id)
     if not product:
-        return jsonify({"error": "product not found"}), 404
+        return "Product not found", 404
 
-    order = Order(product=product, amount=product.price, status="pending")
-    db.session.add(order)
-    db.session.commit()
+    product_id, name, price = product
 
-    import stripe
-    stripe.api_key = STRIPE_SECRET_KEY
-    try:
-        session = stripe.checkout.Session.create(
-            payment_method_types=["card"],
-            line_items=[{
-                "price_data": {
-                    "currency": "myr",
-                    "product_data": {"name": product.name, "description": product.description},
-                    "unit_amount": product.price,
-                },
-                "quantity": 1,
-            }],
-            mode="payment",
-            success_url=url_for("success", _external=True) + f"?order_id={order.id}",
-            cancel_url=url_for("cancel", _external=True),
-            metadata={"order_id": order.id, "product_id": product.id},
+    session = stripe.checkout.Session.create(
+        payment_method_types=['card'],
+        line_items=[{
+            "price_data": {
+                "currency": CURRENCY,
+                "product_data": {"name": name},
+                "unit_amount": price * 100  # Stripe pakai sen
+            },
+            "quantity": 1
+        }],
+        mode='payment',
+        success_url=url_for('success', product_code=product_code, _external=True),
+        cancel_url=url_for('home', _external=True)
+    )
+    return redirect(session.url, code=303)
+
+@app.route('/success/<product_code>')
+def success(product_code):
+    api_key = SMS_API_KEY
+    service_code = PRODUCT_MAPPING.get(product_code)
+
+    if not service_code:
+        return "Invalid product code", 400
+
+    url = f"https://sms-activate.ru/stubs/handler_api.php?api_key={api_key}&action=getNumber&service={service_code}&country={SMS_COUNTRY}"
+    r = requests.get(url)
+
+    if "ACCESS_NUMBER" in r.text:
+        parts = r.text.split(':')
+        activation_id = parts[1]
+        phone = parts[2]
+
+        conn = sqlite3.connect("database.db")
+        c = conn.cursor()
+        c.execute("SELECT id, price FROM products WHERE code = ?", (product_code,))
+        p = c.fetchone()
+        c.execute(
+            "INSERT INTO orders (product_id, phone_number, otp_code, amount_paid) VALUES (?, ?, ?, ?)",
+            (p[0], phone, None, p[1])
         )
-    except Exception as e:
-        db.session.delete(order)
-        db.session.commit()
-        return jsonify({"error": str(e)}), 500
+        conn.commit()
+        conn.close()
 
-    order.stripe_session_id = session.id
-    db.session.commit()
-    return jsonify({"checkout_url": session.url})
-
-@app.route("/success")
-def success():
-    order_id = request.args.get("order_id")
-    return render_template("success.html", order_id=order_id)
-
-@app.route("/order/<int:order_id>")
-def view_order(order_id):
-    order = Order.query.get_or_404(order_id)
-    return render_template("order.html", order=order)
-
-@app.route("/admin/orders")
-def admin_orders():
-    orders = Order.query.order_by(Order.created_at.desc()).all()
-    products = Product.query.all()
-    stats = []
-    total_revenue = 0
-    total_orders = len(orders)
-    for p in products:
-        count = Order.query.filter(Order.product_id==p.id, Order.status.in_(["paid","fulfilled"])).count()
-        revenue = db.session.query(db.func.coalesce(db.func.sum(Order.amount), 0)).filter(Order.product_id==p.id, Order.status.in_(["paid","fulfilled"])).scalar() or 0
-        stats.append({"product": p, "count": count, "revenue_cents": int(revenue)})
-        total_revenue += int(revenue)
-    return render_template("admin_orders.html", orders=orders, stats=stats, total_orders=total_orders, total_revenue_cents=total_revenue)
-
-# ---------------- STRIPE WEBHOOK ----------------
-@app.route("/webhook", methods=["POST"])
-def webhook():
-    import stripe, json
-    payload = request.data
-    sig_header = request.headers.get("Stripe-Signature")
-    if STRIPE_WEBHOOK_SECRET:
-        try:
-            event = stripe.Webhook.construct_event(payload, sig_header, STRIPE_WEBHOOK_SECRET)
-        except Exception as e:
-            return jsonify({"error": str(e)}), 400
+        return render_template("success.html", phone=phone, activation_id=activation_id)
     else:
-        try:
-            event = stripe.Event.construct_from(request.get_json(), stripe.api_key)
-        except Exception as e:
-            return jsonify({"error": str(e)}), 400
+        return "Gagal dapat nombor. Cuba lagi."
 
-    if event["type"] == "checkout.session.completed":
-        session = event["data"]["object"]
-        metadata = session.get("metadata") or {}
-        order_id = metadata.get("order_id")
-        if order_id:
-            order = Order.query.get(int(order_id))
-            if order and order.status == "pending":
-                order.status = "paid"
-                order.stripe_payment_intent = session.get("payment_intent")
-                db.session.commit()
-                fulfill_order_with_sms_activate(order.id)
-    return jsonify({"received": True})
+@app.route('/get_otp', methods=['POST'])
+def get_otp():
+    activation_id = request.form.get("activation_id")
+    url = f"https://sms-activate.ru/stubs/handler_api.php?api_key={SMS_API_KEY}&action=getStatus&id={activation_id}"
+    r = requests.get(url)
 
-# ---------------- SMS-ACTIVATE INTEGRATION ----------------
-def fulfill_order_with_sms_activate(order_id):
-    order = Order.query.get(order_id)
-    if not order:
-        return
-    product = order.product
-    if not SMS_ACTIVATE_API_KEY:
-        order.raw_response = "sms_activate_not_configured"
-        order.status = "fulfilled"
-        db.session.commit()
-        return
+    if "STATUS_OK" in r.text:
+        otp = r.text.split(':')[1]
+        return jsonify({"status": "success", "otp": otp})
+    else:
+        return jsonify({"status": "pending", "otp": None})
 
-    params = {
-        "api_key": SMS_ACTIVATE_API_KEY,
-        "action": "getNumber",
-        "service": product.service_code,
-        "country": product.country
-    }
-    try:
-        r = requests.get(SMS_ACTIVATE_API_BASE, params=params, timeout=30)
-        txt = r.text.strip()
-        order.raw_response = txt
-        if txt.startswith("ACCESS_NUMBER"):
-            parts = txt.split(":")
-            if len(parts) >= 3:
-                sa_order_id = parts[1]
-                phone = parts[2]
-                order.sms_activate_order_id = sa_order_id
-                order.number = phone
-                order.status = "fulfilled"
-                db.session.commit()
-                # start polling for SMS (in simple loop; for production use background job)
-                poll_for_otp(order.id, sa_order_id)
-                return
-        order.status = "failed"
-        db.session.commit()
-    except Exception as e:
-        order.status = "failed"
-        order.raw_response = f"exception:{str(e)}"
-        db.session.commit()
-
-def poll_for_otp(order_id, sa_order_id, attempts=15, delay_seconds=5):
-    import time
-    order = Order.query.get(order_id)
-    if not order:
-        return
-    for i in range(attempts):
-        try:
-            params = {"api_key": SMS_ACTIVATE_API_KEY, "action": "getStatus", "id": sa_order_id}
-            r = requests.get(SMS_ACTIVATE_API_BASE, params=params, timeout=20)
-            txt = r.text.strip()
-            # Example responses: STATUS_OK:code, STATUS_WAIT_CODE, STATUS_CANCEL
-            if txt.startswith("STATUS_OK"):
-                # format STATUS_OK:code
-                parts = txt.split(":")
-                if len(parts) >= 2:
-                    code = parts[1]
-                    order.otp_code = code
-                    db.session.commit()
-                    return
-            # wait then retry
-        except Exception:
-            pass
-        time.sleep(delay_seconds)
-
-# ---------------- STATIC FILES SERVE (if needed) ----------------
-@app.route('/static/<path:filename>')
-def static_files(filename):
-    return send_from_directory(os.path.join(BASE_DIR, 'static'), filename)
-
-if __name__ == "__main__":
-    app.run(debug=True, host="0.0.0.0", port=PORT)
+# ----------------------------
+# ✅ RUN
+# ----------------------------
+if __name__ == '__main__':
+    init_db()
+    seed_products()
+    app.run(host='0.0.0.0', port=5000)
